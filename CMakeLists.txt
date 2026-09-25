@@ -66,3 +66,30 @@ target_link_libraries(VirtualPedalboard
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags)
+
+# ------------------------------------------------------------------------------
+# Numerical checks on the DSP. Excluded from the default build so it never slows
+# the app down; build it explicitly when you touch a pedal:
+#   cmake --build build --target vpb_tests && ./build/vpb_tests
+# ------------------------------------------------------------------------------
+add_executable(vpb_tests EXCLUDE_FROM_ALL
+    tests/RunTests.cpp
+    tests/CompressorTests.cpp
+    tests/ProcessorTests.cpp
+    source/PluginProcessor.cpp
+    source/PluginEditor.cpp)
+
+target_include_directories(vpb_tests PRIVATE source tests)
+
+target_compile_definitions(vpb_tests PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_STANDALONE_APPLICATION=1)
+
+target_link_libraries(vpb_tests
+    PRIVATE
+        juce::juce_audio_utils
+        juce::juce_dsp
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)

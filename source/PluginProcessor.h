@@ -18,6 +18,10 @@ public:
     ~VirtualPedalboardProcessor() override = default;
 
     //==============================================================================
+    // We only do single precision; this keeps the unused double overload visible
+    // so the compiler stops warning that we hid it.
+    using juce::AudioProcessor::processBlock;
+
     void prepareToPlay (double sampleRate, int maximumExpectedSamplesPerBlock) override;
     void releaseResources() override;
     bool isBusesLayoutSupported (const BusesLayout&) const override;
