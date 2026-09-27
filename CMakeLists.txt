@@ -41,9 +41,16 @@ juce_add_plugin(VirtualPedalboard
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
     COPY_PLUGIN_AFTER_BUILD     FALSE)
 
-target_sources(VirtualPedalboard PRIVATE
+# The app's own code. The tests compile this same list, so they check what ships.
+set(VPB_SOURCES
     source/PluginProcessor.cpp
-    source/PluginEditor.cpp)
+    source/PluginEditor.cpp
+    source/pedals/PedalProcessor.cpp
+    source/pedals/PedalRack.cpp
+    source/pedals/CompressorProcessor.cpp
+    source/pedals/CompressorEditor.cpp)
+
+target_sources(VirtualPedalboard PRIVATE ${VPB_SOURCES})
 
 target_include_directories(VirtualPedalboard PRIVATE source)
 
@@ -76,8 +83,7 @@ add_executable(vpb_tests EXCLUDE_FROM_ALL
     tests/RunTests.cpp
     tests/CompressorTests.cpp
     tests/ProcessorTests.cpp
-    source/PluginProcessor.cpp
-    source/PluginEditor.cpp)
+    ${VPB_SOURCES})
 
 target_include_directories(vpb_tests PRIVATE source tests)
 

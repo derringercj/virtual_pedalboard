@@ -1,17 +1,30 @@
 # Virtual Pedalboard
 
 A standalone JUCE app that takes your bass in from a Focusrite Scarlett Solo,
-runs it through a compressor, and sends it straight back out to your headphones.
-One pedal for now; the chain is structured so more can be slotted in.
+runs it through a chain of pedals, and sends it straight back out to your headphones.
+The board starts with one compressor.
 
 Also builds as a VST3, so the same code can be loaded in a DAW later.
 
 ```
 source/
-  dsp/CompressorPedal.h   the compressor itself - detector, gain computer, ballistics
-  PluginProcessor.*       audio I/O, parameters, the pedal chain
-  PluginEditor.*          knobs and the gain-reduction meter
+  PluginProcessor.*            the board: input selector, the pedal chain, save/restore
+  PluginEditor.*               the board's window: input selector plus each pedal's panel
+  pedals/PedalProcessor.*      base class every pedal derives from (mono, own parameters, bypass)
+  pedals/PedalRack.*           the list of pedals the board can create
+  pedals/CompressorProcessor.* the compressor pedal: parameters, bypass, meter value
+  pedals/CompressorEditor.*    its panel: knobs and the gain-reduction meter
+  dsp/CompressorPedal.h        the compressor's DSP - detector, gain computer, ballistics
+  ui/Theme.h                   shared colours
 ```
+
+The chain is a `juce::AudioProcessorGraph` with one node per pedal, wired in a
+line from input to output. Adding, removing or reordering pedals rewires it on
+the message thread, and the graph hands the new wiring to the audio thread
+without making it wait.
+
+To add a new pedal type: derive from `PedalProcessor`, give it an editor, and
+add one line to `PedalRack::getEntries()`.
 
 ## Building on Windows
 

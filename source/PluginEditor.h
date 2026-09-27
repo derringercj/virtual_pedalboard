@@ -7,61 +7,52 @@
 
 #include "PluginProcessor.h"
 
-/** Horizontal bar showing how hard the compressor is working right now. Without
-    one of these a compressor is almost impossible to learn by ear alone. */
-class GainReductionMeter final : public juce::Component,
-                                 private juce::Timer
-{
-public:
-    explicit GainReductionMeter (VirtualPedalboardProcessor&);
-
-    void paint (juce::Graphics&) override;
-
-private:
-    void timerCallback() override;
-
-    VirtualPedalboardProcessor& processor;
-    float displayedDb = 0.0f;
-
-    static constexpr float fullScaleDb  = 24.0f;
-    static constexpr float fallPerTickDb = 0.8f;   // ~24 dB/second at 30 Hz
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GainReductionMeter)
-};
-
-//==============================================================================
-class VirtualPedalboardEditor final : public juce::AudioProcessorEditor
+/**
+    The board: the input selector along the top, and below it each pedal's own
+    editor, laid out left to right in signal order. Scrolls sideways once the
+    chain is wider than the window.
+*/
+class VirtualPedalboardEditor final : public juce::AudioProcessorEditor,
+                                      private VirtualPedalboardProcessor::ChainListener
 {
 public:
     explicit VirtualPedalboardEditor (VirtualPedalboardProcessor&);
-    ~VirtualPedalboardEditor() override = default;
+    ~VirtualPedalboardEditor() override;
 
     void paint (juce::Graphics&) override;
     void resized() override;
 
+    /** How many pedal panels are showing - one per pedal, if all is well. */
+    int getNumPedalPanels() const noexcept { return (int) panels.size(); }
+
 private:
     using APVTS = juce::AudioProcessorValueTreeState;
 
-    struct Knob
+    /** A pedal's editor must be deleted the way a plugin host deletes one:
+        tell the pedal first, so it stops pointing at the editor. */
+    struct PanelDeleter
     {
-        juce::Slider slider;
-        juce::Label  label;
-        std::unique_ptr<APVTS::SliderAttachment> attachment;
+        void operator() (juce::AudioProcessorEditor* editor) const
+        {
+            editor->processor.editorBeingDeleted (editor);
+            delete editor;
+        }
     };
 
-    void addKnob (const juce::String& parameterID, const juce::String& text,
-                  const juce::String& suffix);
+    using Panel = std::unique_ptr<juce::AudioProcessorEditor, PanelDeleter>;
 
-    VirtualPedalboardProcessor& processor;
+    void pedalChainChanged() override;
+    void rebuildPanels();
 
-    juce::Label      titleLabel, meterLabel, inputLabel;
-    juce::TextButton bypassButton { "BYPASS" };
-    juce::ComboBox   inputBox;
-    GainReductionMeter meter;
+    VirtualPedalboardProcessor& board;
 
-    std::vector<std::unique_ptr<Knob>>         knobs;
-    std::unique_ptr<APVTS::ButtonAttachment>   bypassAttachment;
+    juce::Label    titleLabel, inputLabel, emptyLabel;
+    juce::ComboBox inputBox;
     std::unique_ptr<APVTS::ComboBoxAttachment> inputAttachment;
+
+    juce::Viewport     viewport;
+    juce::Component    pedalRow;
+    std::vector<Panel> panels;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VirtualPedalboardEditor)
 };

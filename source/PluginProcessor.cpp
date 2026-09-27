@@ -1,50 +1,38 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include "pedals/CompressorProcessor.h"
+#include "pedals/PedalRack.h"
+
+#include <utility>
+
+namespace
+{
+    // Saved-state layout:
+    //   <VirtualPedalboard>
+    //     <Board> ...board parameters... </Board>
+    //     <Chain>
+    //       <Pedal type="compressor" state="...pedal's own state, base64..."/>
+    //     </Chain>
+    //   </VirtualPedalboard>
+    const juce::Identifier stateTag     { "VirtualPedalboard" };
+    const juce::Identifier chainTag     { "Chain" };
+    const juce::Identifier pedalTag     { "Pedal" };
+    const juce::Identifier typeProperty { "type" };
+    const juce::Identifier dataProperty { "state" };
+}
+
 //==============================================================================
 juce::AudioProcessorValueTreeState::ParameterLayout
 VirtualPedalboardProcessor::createParameterLayout()
 {
     using namespace juce;
 
-    // A range whose midpoint sits at `centre` rather than halfway, so the useful
-    // part of an attack or ratio control isn't crammed into the first few degrees.
-    auto skewed = [] (float minimum, float maximum, float centre, float interval)
-    {
-        NormalisableRange<float> range { minimum, maximum, interval };
-        range.setSkewForCentre (centre);
-        return range;
-    };
-
     AudioProcessorValueTreeState::ParameterLayout layout;
 
     layout.add (std::make_unique<AudioParameterChoice> (
         ParameterID { "input", 1 }, "Input",
         StringArray { "In 1 (left)", "In 2 (right)", "Sum 1 + 2" }, 1));
-
-    layout.add (std::make_unique<AudioParameterBool> (
-        ParameterID { "bypass", 1 }, "Bypass", false));
-
-    layout.add (std::make_unique<AudioParameterFloat> (
-        ParameterID { "threshold", 1 }, "Threshold",
-        NormalisableRange<float> { -60.0f, 0.0f, 0.1f }, -18.0f));
-
-    layout.add (std::make_unique<AudioParameterFloat> (
-        ParameterID { "ratio", 1 }, "Ratio", skewed (1.0f, 20.0f, 4.0f, 0.1f), 4.0f));
-
-    layout.add (std::make_unique<AudioParameterFloat> (
-        ParameterID { "knee", 1 }, "Knee",
-        NormalisableRange<float> { 0.0f, 24.0f, 0.5f }, 6.0f));
-
-    layout.add (std::make_unique<AudioParameterFloat> (
-        ParameterID { "attack", 1 }, "Attack", skewed (0.1f, 200.0f, 15.0f, 0.1f), 10.0f));
-
-    layout.add (std::make_unique<AudioParameterFloat> (
-        ParameterID { "release", 1 }, "Release", skewed (10.0f, 1000.0f, 150.0f, 1.0f), 150.0f));
-
-    layout.add (std::make_unique<AudioParameterFloat> (
-        ParameterID { "makeup", 1 }, "Makeup",
-        NormalisableRange<float> { -12.0f, 24.0f, 0.1f }, 0.0f));
 
     return layout;
 }
@@ -54,36 +42,32 @@ VirtualPedalboardProcessor::VirtualPedalboardProcessor()
     : juce::AudioProcessor (BusesProperties()
                                 .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                                 .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-      parameters (*this, nullptr, juce::Identifier ("VirtualPedalboard"), createParameterLayout())
+      parameters (*this, nullptr, juce::Identifier ("Board"), createParameterLayout())
 {
-    inputParam     = parameters.getRawParameterValue ("input");
-    bypassParam    = parameters.getRawParameterValue ("bypass");
-    thresholdParam = parameters.getRawParameterValue ("threshold");
-    ratioParam     = parameters.getRawParameterValue ("ratio");
-    kneeParam      = parameters.getRawParameterValue ("knee");
-    attackParam    = parameters.getRawParameterValue ("attack");
-    releaseParam   = parameters.getRawParameterValue ("release");
-    makeupParam    = parameters.getRawParameterValue ("makeup");
+    inputParam = parameters.getRawParameterValue ("input");
+
+    // The chain is mono, like the real thing: one channel in from the input
+    // selector, one channel out to the fan-out. This has to be set before the
+    // I/O nodes are added, because they size themselves from the graph.
+    graph.setPlayConfigDetails (1, 1, getSampleRate(), getBlockSize());
+
+    using IO = Graph::AudioGraphIOProcessor;
+    inputNode  = graph.addNode (std::make_unique<IO> (IO::audioInputNode),  std::nullopt, UpdateKind::none);
+    outputNode = graph.addNode (std::make_unique<IO> (IO::audioOutputNode), std::nullopt, UpdateKind::none);
+
+    addPedal (CompressorProcessor::pedalTypeId);
 }
 
 //==============================================================================
 void VirtualPedalboardProcessor::prepareToPlay (double sampleRate, int maximumExpectedSamplesPerBlock)
 {
-    juce::dsp::ProcessSpec spec;
-    spec.sampleRate       = sampleRate;
-    spec.maximumBlockSize = (juce::uint32) juce::jmax (1, maximumExpectedSamplesPerBlock);
-    spec.numChannels      = 1;                 // the pedal chain is mono, like the real thing
-
-    compressor.prepare (spec);
-    pushParametersToPedals();
-    compressor.reset();
-
-    gainReductionDb.store (0.0f, std::memory_order_relaxed);
+    // Prepares every pedal now, and any pedal added later as it joins.
+    graph.prepareToPlay (sampleRate, maximumExpectedSamplesPerBlock);
 }
 
 void VirtualPedalboardProcessor::releaseResources()
 {
-    compressor.reset();
+    graph.releaseResources();
 }
 
 bool VirtualPedalboardProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -100,18 +84,8 @@ bool VirtualPedalboardProcessor::isBusesLayoutSupported (const BusesLayout& layo
     return true;
 }
 
-void VirtualPedalboardProcessor::pushParametersToPedals() noexcept
-{
-    compressor.setThresholdDb (thresholdParam->load (std::memory_order_relaxed));
-    compressor.setRatio       (ratioParam    ->load (std::memory_order_relaxed));
-    compressor.setKneeDb      (kneeParam     ->load (std::memory_order_relaxed));
-    compressor.setAttackMs    (attackParam   ->load (std::memory_order_relaxed));
-    compressor.setReleaseMs   (releaseParam  ->load (std::memory_order_relaxed));
-    compressor.setMakeupDb    (makeupParam   ->load (std::memory_order_relaxed));
-}
-
 //==============================================================================
-void VirtualPedalboardProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+void VirtualPedalboardProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;
 
@@ -125,8 +99,6 @@ void VirtualPedalboardProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     // Any output channel the host gave us beyond the inputs holds junk - clear it.
     for (auto ch = numIns; ch < numOuts; ++ch)
         buffer.clear (ch, 0, numSamples);
-
-    pushParametersToPedals();
 
     // --- 1. Collapse the interface's inputs down to the one mono bass signal ---
     // Input and output share this buffer, so channel 0 doubles as our workspace.
@@ -148,28 +120,118 @@ void VirtualPedalboardProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         }
     }
 
-    // --- 2. The pedal chain. One pedal today; the rest go here later. ---
-    float maxReductionDb = 0.0f;
-    const auto bypassed = bypassParam->load (std::memory_order_relaxed) >= 0.5f;
-
-    if (bypassed)
-    {
-        compressor.reset();
-    }
-    else
-    {
-        for (int i = 0; i < numSamples; ++i)
-        {
-            mono[i] = compressor.processSample (mono[i]);
-            maxReductionDb = juce::jmax (maxReductionDb, compressor.getCurrentReductionDb());
-        }
-    }
-
-    gainReductionDb.store (maxReductionDb, std::memory_order_relaxed);
+    // --- 2. The pedal chain ---
+    // A one-channel view onto channel 0. It points at the same memory, so the
+    // graph works on the bass in place with no copying or allocation here.
+    juce::AudioBuffer<float> monoBuffer (buffer.getArrayOfWritePointers(), 1, numSamples);
+    graph.processBlock (monoBuffer, midi);
 
     // --- 3. Fan the mono result back out to every output the device gives us ---
     for (auto ch = 1; ch < numOuts; ++ch)
         juce::FloatVectorOperations::copy (buffer.getWritePointer (ch), mono, numSamples);
+}
+
+//==============================================================================
+PedalProcessor* VirtualPedalboardProcessor::getPedal (int index) const noexcept
+{
+    if (! juce::isPositiveAndBelow (index, getNumPedals()))
+        return nullptr;
+
+    // Only PedalRack puts processors into the chain, so this always succeeds.
+    return dynamic_cast<PedalProcessor*> (chain[(size_t) index]->getProcessor());
+}
+
+PedalProcessor* VirtualPedalboardProcessor::addPedal (const juce::String& typeId, int index)
+{
+    auto pedal = PedalRack::create (typeId);
+
+    if (pedal == nullptr)
+        return nullptr;
+
+    if (! juce::isPositiveAndNotGreaterThan (index, getNumPedals()))
+        index = getNumPedals();
+
+    auto* added = pedal.get();
+    insertPedalNode (std::move (pedal), index);
+    chainChanged();
+    return added;
+}
+
+void VirtualPedalboardProcessor::removePedal (int index)
+{
+    if (! juce::isPositiveAndBelow (index, getNumPedals()))
+        return;
+
+    // Holding this keeps the pedal alive until listeners have heard about it.
+    const auto removed = chain[(size_t) index];
+
+    chain.erase (chain.begin() + index);
+    graph.removeNode (removed->nodeID, UpdateKind::none);
+    chainChanged();
+}
+
+void VirtualPedalboardProcessor::movePedal (int fromIndex, int toIndex)
+{
+    if (! juce::isPositiveAndBelow (fromIndex, getNumPedals())
+        || ! juce::isPositiveAndBelow (toIndex, getNumPedals())
+        || fromIndex == toIndex)
+        return;
+
+    auto node = chain[(size_t) fromIndex];
+    chain.erase (chain.begin() + fromIndex);
+    chain.insert (chain.begin() + toIndex, std::move (node));
+    chainChanged();
+}
+
+void VirtualPedalboardProcessor::insertPedalNode (std::unique_ptr<PedalProcessor> pedal, int index)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    if (auto node = graph.addNode (std::move (pedal), std::nullopt, UpdateKind::none))
+        chain.insert (chain.begin() + index, std::move (node));
+}
+
+void VirtualPedalboardProcessor::replaceChain (std::vector<std::unique_ptr<PedalProcessor>> pedals)
+{
+    // Holding these keeps the old pedals alive until listeners have heard about it.
+    const auto oldChain = std::exchange (chain, {});
+
+    for (const auto& node : oldChain)
+        graph.removeNode (node->nodeID, UpdateKind::none);
+
+    for (auto& pedal : pedals)
+        insertPedalNode (std::move (pedal), getNumPedals());
+
+    chainChanged();
+}
+
+void VirtualPedalboardProcessor::chainChanged()
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    // Rewire the whole line from scratch: input -> pedal -> pedal -> ... -> output.
+    // Every step is UpdateKind::none so the graph is rebuilt once at the end,
+    // rather than the audio thread briefly hearing a half-wired chain.
+    for (const auto& connection : graph.getConnections())
+        graph.removeConnection (connection, UpdateKind::none);
+
+    auto previous = inputNode->nodeID;
+
+    for (const auto& node : chain)
+    {
+        [[maybe_unused]] const auto connected = graph.addConnection ({ { previous, 0 }, { node->nodeID, 0 } },
+                                                                     UpdateKind::none);
+        jassert (connected);
+        previous = node->nodeID;
+    }
+
+    [[maybe_unused]] const auto connected = graph.addConnection ({ { previous, 0 }, { outputNode->nodeID, 0 } },
+                                                                 UpdateKind::none);
+    jassert (connected);
+
+    graph.rebuild();
+
+    chainListeners.call ([] (ChainListener& listener) { listener.pedalChainChanged(); });
 }
 
 //==============================================================================
@@ -180,15 +242,88 @@ juce::AudioProcessorEditor* VirtualPedalboardProcessor::createEditor()
 
 void VirtualPedalboardProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    if (auto xml = parameters.copyState().createXml())
+    juce::ValueTree chainState { chainTag };
+
+    for (int i = 0; i < getNumPedals(); ++i)
+    {
+        auto* pedal = getPedal (i);
+
+        // Each pedal saves itself, the same way a plugin saves itself for a DAW.
+        juce::MemoryBlock pedalData;
+        pedal->getStateInformation (pedalData);
+
+        chainState.appendChild (juce::ValueTree { pedalTag, { { typeProperty, pedal->getTypeId() },
+                                                              { dataProperty, pedalData.toBase64Encoding() } } },
+                                nullptr);
+    }
+
+    juce::ValueTree state { stateTag };
+    state.appendChild (parameters.copyState(), nullptr);
+    state.appendChild (chainState, nullptr);
+
+    if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
 
 void VirtualPedalboardProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    if (auto xml = getXmlFromBinary (data, sizeInBytes))
-        if (xml->hasTagName (parameters.state.getType()))
-            parameters.replaceState (juce::ValueTree::fromXml (*xml));
+    const auto xml = getXmlFromBinary (data, sizeInBytes);
+
+    if (xml == nullptr || ! xml->hasTagName (stateTag.toString()))
+        return;
+
+    const auto state      = juce::ValueTree::fromXml (*xml);
+    const auto chainState = state.getChildWithName (chainTag);
+
+    std::vector<std::unique_ptr<PedalProcessor>> pedals;
+
+    if (chainState.isValid())
+    {
+        if (const auto board = state.getChildWithName (parameters.state.getType()); board.isValid())
+            parameters.replaceState (board);
+
+        for (const auto& pedalState : chainState)
+        {
+            // Skips a pedal this build doesn't know, rather than failing the whole board.
+            auto pedal = PedalRack::create (pedalState[typeProperty].toString());
+
+            if (pedal == nullptr)
+                continue;
+
+            juce::MemoryBlock pedalData;
+
+            if (pedalData.fromBase64Encoding (pedalState[dataProperty].toString()))
+                pedal->setStateInformation (pedalData.getData(), (int) pedalData.getSize());
+
+            pedals.push_back (std::move (pedal));
+        }
+    }
+    else
+    {
+        pedals.push_back (restoreLegacyState (state));
+    }
+
+    replaceChain (std::move (pedals));
+}
+
+std::unique_ptr<PedalProcessor> VirtualPedalboardProcessor::restoreLegacyState (const juce::ValueTree& state)
+{
+    // Before the pedal chain existed, the app saved one flat list of parameters:
+    // the input selector plus the single compressor's knobs. That becomes a
+    // board holding one compressor, so an upgrade doesn't lose anyone's settings.
+    auto compressor = PedalRack::create (CompressorProcessor::pedalTypeId);
+
+    for (const auto& parameterState : state)
+    {
+        const auto id    = parameterState["id"].toString();
+        const auto value = (float) parameterState["value"];
+
+        for (auto* apvts : { &parameters, &compressor->getValueTreeState() })
+            if (auto* parameter = apvts->getParameter (id))
+                parameter->setValueNotifyingHost (parameter->convertTo0to1 (value));
+    }
+
+    return compressor;
 }
 
 //==============================================================================
