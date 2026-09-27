@@ -26,6 +26,8 @@ without making it wait.
 To add a new pedal type: derive from `PedalProcessor`, give it an editor, and
 add one line to `PedalRack::getEntries()`.
 
+Full documentation of the structure and every class is in [docs/](docs/README.md).
+
 ## Building on Windows
 
 Needs Visual Studio 2022 with the **Desktop development with C++** workload,
